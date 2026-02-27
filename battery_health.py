@@ -487,11 +487,11 @@ def main():
         batteries = get_battery_info_macos()
     else:
         print(f"Unsupported OS: {system}", file=sys.stderr)
-        sys.exit(1)
+        return 1
 
     if not batteries:
         print("No battery detected or unable to read battery information.")
-        sys.exit(1)
+        return 1
 
     for bat in batteries:
         print(f"Battery: {bat['device_id']}")
@@ -512,6 +512,14 @@ def main():
             print(f"  Cycle Count:          {int(bat['cycle_count'])}")
         print()
 
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    exit_code = main()
+    if getattr(sys, "frozen", False):
+        try:
+            input("Press Enter to exit...")
+        except EOFError:
+            pass
+    sys.exit(exit_code)
