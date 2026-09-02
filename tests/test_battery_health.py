@@ -99,6 +99,88 @@ class TestParsing(unittest.TestCase):
         self.assertAlmostEqual(batteries[0]["health_percent"], 90.0, places=2)
 
 
+def _life_estimates_report(include_estimates=True):
+    """
+    Mirrors the shape of a real powercfg report: a usage history table whose rows
+    are structurally identical to the battery life estimates rows, followed by the
+    per-period estimates table and the single-row "since OS install" table.
+    """
+    usage_history = """
+    <h2>Usage history</h2>
+    <table>
+        <thead>
+            <tr><td> </td><td colspan="2">BATTERY DURATION</td><td class="colBreak"> </td><td colspan="3">AC DURATION</td></tr>
+            <tr><td>PERIOD</td><td>ACTIVE</td><td>CONNECTED STANDBY</td><td class="colBreak"> </td><td>ACTIVE</td><td>CONNECTED STANDBY</td></tr>
+        </thead>
+        <tr><td class="dateTime">2026-04-06 - 2026-04-13</td><td class="hms">6:52:40</td><td class="nullValue">-</td><td class="colBreak"> </td><td class="hms">53:51:51</td><td class="nullValue">-</td></tr>
+        <tr><td class="dateTime">2026-04-13 - 2026-04-20</td><td class="hms">8:23:36</td><td class="nullValue">-</td><td class="colBreak"> </td><td class="hms">62:24:24</td><td class="nullValue">-</td></tr>
+    </table>
+    """
+
+    if not include_estimates:
+        return f"<html><body>{usage_history}</body></html>"
+
+    estimates = """
+    <h2>Battery life estimates</h2>
+    <table>
+        <thead>
+            <tr><td> </td><td colspan="2">AT FULL CHARGE</td><td class="colBreak"> </td><td colspan="2">AT DESIGN CAPACITY</td></tr>
+            <tr><td>PERIOD</td><td>ACTIVE</td><td>CONNECTED STANDBY</td><td class="colBreak"> </td><td>ACTIVE</td><td>CONNECTED STANDBY</td></tr>
+        </thead>
+        <tr><td class="dateTime">2026-08-24</td><td class="nullValue">-</td><td class="nullValue">-</td><td class="colBreak"> </td><td class="nullValue">-</td><td class="nullValue">-</td></tr>
+        <tr><td class="dateTime">2026-08-25</td><td class="hms">2:00:00</td><td class="nullValue">-</td><td class="colBreak"> </td><td class="hms">3:30:00</td><td class="nullValue">-</td></tr>
+        <tr><td class="dateTime">2026-08-26</td><td class="hms">3:00:00</td><td class="nullValue">-</td><td class="colBreak"> </td><td class="hms">5:00:00</td><td class="nullValue">-</td></tr>
+    </table>
+    <table>
+        <tr><td>Since OS install</td><td class="hms">2:29:47</td><td class="nullValue">-</td><td class="colBreak"> </td><td class="hms">4:23:11</td><td class="nullValue">-</td></tr>
+    </table>
+    """
+    return f"<html><body>{usage_history}{estimates}</body></html>"
+
+
+class TestBatteryLifeEstimates(unittest.TestCase):
+    def test_parse_duration_to_hours(self):
+        self.assertAlmostEqual(battery_health._parse_duration_to_hours("2:29:47"), 2.4963889, places=6)
+        self.assertAlmostEqual(battery_health._parse_duration_to_hours("1:02:00:00"), 26.0, places=6)
+        self.assertIsNone(battery_health._parse_duration_to_hours("-"))
+        self.assertIsNone(battery_health._parse_duration_to_hours(""))
+        self.assertIsNone(battery_health._parse_duration_to_hours("0:00:00"))
+        self.assertIsNone(battery_health._parse_duration_to_hours("53,210 mWh"))
+
+    def test_parses_since_os_install_estimates(self):
+        estimates = battery_health._parse_battery_life_estimates(_life_estimates_report())
+
+        self.assertIsNotNone(estimates)
+        self.assertAlmostEqual(estimates["full_charge_hours"], 2.4963889, places=6)
+        self.assertAlmostEqual(estimates["design_capacity_hours"], 4.3863889, places=6)
+
+    def test_ignores_lookalike_usage_history_table(self):
+        # Usage history rows have the same shape but mean hours spent on battery,
+        # not runtime on a full charge, so they must never feed the estimates.
+        estimates = battery_health._parse_battery_life_estimates(_life_estimates_report())
+
+        self.assertAlmostEqual(estimates["recent_full_charge_hours"], 2.5, places=6)
+        self.assertEqual(estimates["recent_period_count"], 2)
+
+    def test_returns_none_without_estimates_section(self):
+        report = _life_estimates_report(include_estimates=False)
+        self.assertIsNone(battery_health._parse_battery_life_estimates(report))
+
+    def test_returns_none_when_never_run_on_battery(self):
+        report = """
+        <html><body>
+        <table>
+            <tr><td>Since OS install</td><td class="nullValue">-</td><td class="nullValue">-</td><td class="colBreak"> </td><td class="nullValue">-</td><td class="nullValue">-</td></tr>
+        </table>
+        </body></html>
+        """
+        self.assertIsNone(battery_health._parse_battery_life_estimates(report))
+
+    def test_format_hours(self):
+        self.assertEqual(battery_health._format_hours(2.4963889), "2h 30m")
+        self.assertEqual(battery_health._format_hours(4.0), "4h 00m")
+
+
 class TestWindowsEnrichment(unittest.TestCase):
     def test_enrich_windows_batteries_adds_current_capacity_and_voltage(self):
         batteries = [

@@ -46,25 +46,39 @@ def _normalize_device_id(device_id):
 # ------------------------------------------------------------
 # Windows implementation
 # ------------------------------------------------------------
+def _normalize_cell(cell_html):
+    plain = re.sub(r"<[^>]+>", " ", cell_html)
+    plain = html.unescape(plain)
+    return " ".join(plain.split())
+
+
+def _find_tables(report_html):
+    return re.findall(r"<table[^>]*>(.*?)</table>", report_html, flags=re.IGNORECASE | re.DOTALL)
+
+
+def _parse_table_rows(table_html):
+    parsed_rows = []
+    row_html_list = re.findall(r"<tr[^>]*>(.*?)</tr>", table_html, flags=re.IGNORECASE | re.DOTALL)
+    for row_html in row_html_list:
+        cell_html_list = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row_html, flags=re.IGNORECASE | re.DOTALL)
+        if not cell_html_list:
+            continue
+        parsed_rows.append([_normalize_cell(cell) for cell in cell_html_list])
+    return parsed_rows
+
+
+def _looks_like_date(text):
+    value = text.strip()
+    return bool(
+        re.match(r"^\d{4}-\d{2}-\d{2}$", value)
+        or re.match(r"^\d{4}-\d{2}-\d{2}\s*-\s*\d{4}-\d{2}-\d{2}$", value)
+    )
+
+
 def _parse_battery_report_html(report_html):
     """
     Parse powercfg battery report HTML and return battery list.
     """
-    def _normalize_cell(cell_html):
-        plain = re.sub(r"<[^>]+>", " ", cell_html)
-        plain = html.unescape(plain)
-        return " ".join(plain.split())
-
-    def _parse_rows(table_html):
-        parsed_rows = []
-        row_html_list = re.findall(r"<tr[^>]*>(.*?)</tr>", table_html, flags=re.IGNORECASE | re.DOTALL)
-        for row_html in row_html_list:
-            cell_html_list = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row_html, flags=re.IGNORECASE | re.DOTALL)
-            if not cell_html_list:
-                continue
-            parsed_rows.append([_normalize_cell(cell) for cell in cell_html_list])
-        return parsed_rows
-
     def _parse_header_table(rows):
         headers_upper = [h.upper() for h in rows[0]]
         if "DESIGN CAPACITY" not in headers_upper or "FULL CHARGE CAPACITY" not in headers_upper:
@@ -140,13 +154,6 @@ def _parse_battery_report_html(report_html):
 
         return [battery]
 
-    def _looks_like_date(text):
-        value = text.strip()
-        return bool(
-            re.match(r"^\d{4}-\d{2}-\d{2}$", value)
-            or re.match(r"^\d{4}-\d{2}-\d{2}\s*-\s*\d{4}-\d{2}-\d{2}$", value)
-        )
-
     def _parse_two_column_mwh_table(rows):
         # Locale-tolerant fallback: parse 2-column tables by values (mWh) rather than labels.
         if not rows or not all(len(row) >= 2 for row in rows):
@@ -194,9 +201,8 @@ def _parse_battery_report_html(report_html):
             battery["cycle_count"] = cycle_count
         return [battery]
 
-    tables = re.findall(r"<table[^>]*>(.*?)</table>", report_html, flags=re.IGNORECASE | re.DOTALL)
-    for table_html in tables:
-        rows = _parse_rows(table_html)
+    for table_html in _find_tables(report_html):
+        rows = _parse_table_rows(table_html)
         if not rows:
             continue
 
@@ -209,6 +215,128 @@ def _parse_battery_report_html(report_html):
             return batteries
 
     return []
+
+
+# ------------------------------------------------------------
+# Windows battery life estimates ("how long does a full charge last")
+# ------------------------------------------------------------
+_DURATION_RE = re.compile(r"^\d{1,5}(?::\d{2}){2,3}$")
+
+# How many trailing report periods feed the "recent" average.
+_RECENT_PERIOD_COUNT = 8
+
+
+def _parse_duration_to_hours(duration_text):
+    """
+    Convert a powercfg duration cell ("2:29:47", or "1:02:29:47" when it spans
+    days) into hours. Returns None for missing ("-") or unrecognized values.
+    """
+    value = (duration_text or "").strip()
+    if not _DURATION_RE.match(value):
+        return None
+
+    parts = [int(part) for part in value.split(":")]
+    if len(parts) == 4:
+        days, hours, minutes, seconds = parts
+    else:
+        days = 0
+        hours, minutes, seconds = parts
+
+    total_hours = days * 24 + hours + minutes / 60.0 + seconds / 3600.0
+    return total_hours if total_hours > 0 else None
+
+
+def _split_life_estimate_row(cells):
+    """
+    Rows of the battery life estimates tables are laid out as:
+        PERIOD | ACTIVE | CONNECTED STANDBY | <spacer> | ACTIVE | CONNECTED STANDBY
+    The first ACTIVE column is the estimate at the battery's current full charge
+    capacity, the second is the estimate at its design capacity. Only ACTIVE is
+    used; connected standby measures sleep drain rather than usable runtime.
+
+    Returns (full_charge_hours, design_capacity_hours); either may be None.
+    """
+    if len(cells) < 5:
+        return None, None
+
+    # The spacer column separates the two groups. It is the only truly empty
+    # cell in a data row, because missing values are rendered as "-".
+    spacer_idx = next((i for i in range(2, len(cells) - 1) if not cells[i]), None)
+    design_idx = spacer_idx + 1 if spacer_idx is not None else 4
+    if design_idx >= len(cells):
+        return None, None
+
+    return _parse_duration_to_hours(cells[1]), _parse_duration_to_hours(cells[design_idx])
+
+
+def _average_recent_estimates(rows):
+    """
+    Average the trailing rows of the per-period estimates table. The since-install
+    figure is diluted by history from when the pack was younger, so recent periods
+    describe its current condition more closely.
+    """
+    period_hours = []
+    for cells in rows:
+        full_charge_hours, design_capacity_hours = _split_life_estimate_row(cells)
+        if full_charge_hours is None:
+            continue
+        # Design capacity is never below full charge capacity, so the runtime at
+        # design capacity cannot be the shorter of the two. A row saying otherwise
+        # means this is not the estimates table.
+        if design_capacity_hours is not None and design_capacity_hours < full_charge_hours:
+            return {}
+        period_hours.append(full_charge_hours)
+
+    if not period_hours:
+        return {}
+
+    recent = period_hours[-_RECENT_PERIOD_COUNT:]
+    return {
+        "recent_full_charge_hours": sum(recent) / len(recent),
+        "recent_period_count": len(recent),
+    }
+
+
+def _parse_battery_life_estimates(report_html):
+    """
+    Parse the "Battery life estimates" section of a powercfg battery report.
+
+    These are Windows' own estimates of how long a *full* charge lasts based on
+    the drains it has actually observed on this machine, so they answer "how long
+    does this laptop run from 100% to 0%" rather than "how long is left right
+    now". The figures cover the system as a whole, not an individual battery.
+
+    Section headings are localized, so the tables are located structurally: the
+    report ends with a single-row "since OS install" table, immediately preceded
+    by the per-period table. Both have the same row shape as the unrelated usage
+    history table, which is why position rather than shape is the anchor.
+
+    Returns None when the report carries no usable estimates, for example on a
+    machine that has never run on battery.
+    """
+    tables = [_parse_table_rows(table_html) for table_html in _find_tables(report_html)]
+
+    for index in range(len(tables) - 1, -1, -1):
+        rows = tables[index]
+        if len(rows) != 1:
+            continue
+
+        full_charge_hours, design_capacity_hours = _split_life_estimate_row(rows[0])
+        if full_charge_hours is None and design_capacity_hours is None:
+            continue
+
+        estimates = {
+            "full_charge_hours": full_charge_hours,
+            "design_capacity_hours": design_capacity_hours,
+        }
+
+        previous_rows = tables[index - 1] if index > 0 else []
+        if len(previous_rows) > 1:
+            estimates.update(_average_recent_estimates(previous_rows))
+
+        return estimates
+
+    return None
 
 
 def _get_battery_info_windows_powercfg():
@@ -226,7 +354,14 @@ def _get_battery_info_windows_powercfg():
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
         report_html = _read_text_with_fallbacks(report_path)
-        return _parse_battery_report_html(report_html)
+        batteries = _parse_battery_report_html(report_html)
+
+        estimates = _parse_battery_life_estimates(report_html)
+        if estimates:
+            for battery in batteries:
+                battery["runtime_estimates"] = estimates
+
+        return batteries
     except (subprocess.CalledProcessError, FileNotFoundError, OSError):
         return []
     finally:
@@ -476,6 +611,33 @@ def get_battery_info_macos():
 # ------------------------------------------------------------
 # Main dispatcher
 # ------------------------------------------------------------
+def _format_hours(hours):
+    total_minutes = int(round(hours * 60))
+    return f"{total_minutes // 60}h {total_minutes % 60:02d}m"
+
+
+def _print_runtime_estimates(estimates):
+    print("Estimated Runtime on a Full Charge (100% -> 0%)")
+
+    full_charge_hours = estimates.get("full_charge_hours")
+    if full_charge_hours:
+        print(f"  Typical, all-time:    {_format_hours(full_charge_hours)}")
+
+    recent_hours = estimates.get("recent_full_charge_hours")
+    if recent_hours:
+        period_count = estimates.get("recent_period_count", 0)
+        print(f"  Typical, recent:      {_format_hours(recent_hours)}  (last {period_count} periods)")
+
+    design_capacity_hours = estimates.get("design_capacity_hours")
+    if design_capacity_hours:
+        print(f"  If battery were new:  {_format_hours(design_capacity_hours)}")
+
+    print()
+    print("  Based on drains Windows actually observed on this machine, so it")
+    print("  reflects how this laptop has really been used, not a benchmark.")
+    print()
+
+
 def main():
     system = platform.system()
 
@@ -511,6 +673,11 @@ def main():
         if "cycle_count" in bat:
             print(f"  Cycle Count:          {int(bat['cycle_count'])}")
         print()
+
+    # System-wide rather than per battery, so it is printed once after the list.
+    estimates = next((bat["runtime_estimates"] for bat in batteries if "runtime_estimates" in bat), None)
+    if estimates:
+        _print_runtime_estimates(estimates)
 
     return 0
 
