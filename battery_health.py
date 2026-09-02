@@ -13,22 +13,28 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+# A battery record is a dict with a fixed but sparse set of keys (some fields
+# are only present when the platform/report exposes them), hence Dict[str, Any]
+# rather than a rigid TypedDict.
+Battery = Dict[str, Any]
 
 
-def _safe_health(full_capacity, design_capacity):
+def _safe_health(full_capacity: Union[int, float], design_capacity: Union[int, float]) -> float:
     if not full_capacity or not design_capacity:
         return 0.0
     return round((full_capacity / design_capacity) * 100, 2)
 
 
-def _extract_first_int(text):
+def _extract_first_int(text: Optional[str]) -> int:
     match = re.search(r"(\d[\d,]*)", text or "")
     if not match:
         return 0
     return int(match.group(1).replace(",", ""))
 
 
-def _read_text_with_fallbacks(path):
+def _read_text_with_fallbacks(path: Path) -> str:
     raw = path.read_bytes()
     for encoding in ("utf-8", "utf-16", "utf-16-le", "cp1252"):
         try:
@@ -38,7 +44,7 @@ def _read_text_with_fallbacks(path):
     return raw.decode("utf-8", errors="ignore")
 
 
-def _normalize_device_id(device_id):
+def _normalize_device_id(device_id: Optional[str]) -> str:
     value = (device_id or "").upper()
     return re.sub(r"[^A-Z0-9]", "", value)
 
@@ -46,28 +52,34 @@ def _normalize_device_id(device_id):
 # ------------------------------------------------------------
 # Windows implementation
 # ------------------------------------------------------------
-def _normalize_cell(cell_html):
+def _normalize_cell(cell_html: str) -> str:
     plain = re.sub(r"<[^>]+>", " ", cell_html)
     plain = html.unescape(plain)
     return " ".join(plain.split())
 
 
-def _find_tables(report_html):
-    return re.findall(r"<table[^>]*>(.*?)</table>", report_html, flags=re.IGNORECASE | re.DOTALL)
+def _find_tables(report_html: str) -> List[str]:
+    return re.findall(
+        r"<table[^>]*>(.*?)</table>", report_html, flags=re.IGNORECASE | re.DOTALL
+    )
 
 
-def _parse_table_rows(table_html):
-    parsed_rows = []
-    row_html_list = re.findall(r"<tr[^>]*>(.*?)</tr>", table_html, flags=re.IGNORECASE | re.DOTALL)
+def _parse_table_rows(table_html: str) -> List[List[str]]:
+    parsed_rows: List[List[str]] = []
+    row_html_list = re.findall(
+        r"<tr[^>]*>(.*?)</tr>", table_html, flags=re.IGNORECASE | re.DOTALL
+    )
     for row_html in row_html_list:
-        cell_html_list = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row_html, flags=re.IGNORECASE | re.DOTALL)
+        cell_html_list = re.findall(
+            r"<t[dh][^>]*>(.*?)</t[dh]>", row_html, flags=re.IGNORECASE | re.DOTALL
+        )
         if not cell_html_list:
             continue
         parsed_rows.append([_normalize_cell(cell) for cell in cell_html_list])
     return parsed_rows
 
 
-def _looks_like_date(text):
+def _looks_like_date(text: str) -> bool:
     value = text.strip()
     return bool(
         re.match(r"^\d{4}-\d{2}-\d{2}$", value)
@@ -75,13 +87,16 @@ def _looks_like_date(text):
     )
 
 
-def _parse_battery_report_html(report_html):
+def _parse_battery_report_html(report_html: str) -> List[Battery]:
     """
     Parse powercfg battery report HTML and return battery list.
     """
-    def _parse_header_table(rows):
+    def _parse_header_table(rows: List[List[str]]) -> List[Battery]:
         headers_upper = [h.upper() for h in rows[0]]
-        if "DESIGN CAPACITY" not in headers_upper or "FULL CHARGE CAPACITY" not in headers_upper:
+        if (
+            "DESIGN CAPACITY" not in headers_upper
+            or "FULL CHARGE CAPACITY" not in headers_upper
+        ):
             return []
         # Avoid "BATTERY CAPACITY HISTORY" table where "PERIOD" is the identifier.
         if "PERIOD" in headers_upper:
@@ -92,7 +107,7 @@ def _parse_battery_report_html(report_html):
         full_idx = headers_upper.index("FULL CHARGE CAPACITY")
         cycle_idx = headers_upper.index("CYCLE COUNT") if "CYCLE COUNT" in headers_upper else None
 
-        batteries = []
+        batteries: List[Battery] = []
         for row in rows[1:]:
             max_idx = max(full_idx, design_idx, name_idx)
             if len(row) <= max_idx:
@@ -120,8 +135,8 @@ def _parse_battery_report_html(report_html):
 
         return batteries
 
-    def _parse_key_value_table(rows):
-        kv = {}
+    def _parse_key_value_table(rows: List[List[str]]) -> List[Battery]:
+        kv: Dict[str, str] = {}
         for row in rows:
             if len(row) < 2:
                 continue
@@ -154,14 +169,14 @@ def _parse_battery_report_html(report_html):
 
         return [battery]
 
-    def _parse_two_column_mwh_table(rows):
+    def _parse_two_column_mwh_table(rows: List[List[str]]) -> List[Battery]:
         # Locale-tolerant fallback: parse 2-column tables by values (mWh) rather than labels.
         if not rows or not all(len(row) >= 2 for row in rows):
             return []
 
-        mwh_values = []
-        device_name = None
-        cycle_count = None
+        mwh_values: List[int] = []
+        device_name: Optional[str] = None
+        cycle_count: Optional[int] = None
 
         for row in rows:
             left = row[0].strip()
@@ -226,7 +241,7 @@ _DURATION_RE = re.compile(r"^\d{1,5}(?::\d{2}){2,3}$")
 _RECENT_PERIOD_COUNT = 8
 
 
-def _parse_duration_to_hours(duration_text):
+def _parse_duration_to_hours(duration_text: Optional[str]) -> Optional[float]:
     """
     Convert a powercfg duration cell ("2:29:47", or "1:02:29:47" when it spans
     days) into hours. Returns None for missing ("-") or unrecognized values.
@@ -246,7 +261,7 @@ def _parse_duration_to_hours(duration_text):
     return total_hours if total_hours > 0 else None
 
 
-def _split_life_estimate_row(cells):
+def _split_life_estimate_row(cells: List[str]) -> Tuple[Optional[float], Optional[float]]:
     """
     Rows of the battery life estimates tables are laid out as:
         PERIOD | ACTIVE | CONNECTED STANDBY | <spacer> | ACTIVE | CONNECTED STANDBY
@@ -269,13 +284,13 @@ def _split_life_estimate_row(cells):
     return _parse_duration_to_hours(cells[1]), _parse_duration_to_hours(cells[design_idx])
 
 
-def _average_recent_estimates(rows):
+def _average_recent_estimates(rows: List[List[str]]) -> Dict[str, Any]:
     """
     Average the trailing rows of the per-period estimates table. The since-install
     figure is diluted by history from when the pack was younger, so recent periods
     describe its current condition more closely.
     """
-    period_hours = []
+    period_hours: List[float] = []
     for cells in rows:
         full_charge_hours, design_capacity_hours = _split_life_estimate_row(cells)
         if full_charge_hours is None:
@@ -297,7 +312,7 @@ def _average_recent_estimates(rows):
     }
 
 
-def _parse_battery_life_estimates(report_html):
+def _parse_battery_life_estimates(report_html: str) -> Optional[Dict[str, Any]]:
     """
     Parse the "Battery life estimates" section of a powercfg battery report.
 
@@ -339,19 +354,23 @@ def _parse_battery_life_estimates(report_html):
     return None
 
 
-def _get_battery_info_windows_powercfg():
+def _get_battery_info_windows_powercfg() -> List[Battery]:
     """
     Query battery information on Windows via:
       powercfg /batteryreport /output <tempfile>
     The generated report file is always cleaned up.
     """
-    report_path = None
+    report_path: Optional[Path] = None
     try:
-        with tempfile.NamedTemporaryFile(prefix="battery_report_", suffix=".html", delete=False) as temp_file:
+        with tempfile.NamedTemporaryFile(
+            prefix="battery_report_", suffix=".html", delete=False
+        ) as temp_file:
             report_path = Path(temp_file.name)
 
         cmd = ["powercfg", "/batteryreport", "/output", str(report_path)]
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        subprocess.run(
+            cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
 
         report_html = _read_text_with_fallbacks(report_path)
         batteries = _parse_battery_report_html(report_html)
@@ -372,7 +391,7 @@ def _get_battery_info_windows_powercfg():
                 pass
 
 
-def _get_battery_info_windows_wmic_fallback():
+def _get_battery_info_windows_wmic_fallback() -> List[Battery]:
     """
     Legacy fallback for older Windows systems where WMIC is still available.
     """
@@ -390,7 +409,7 @@ def _get_battery_info_windows_wmic_fallback():
         if len(lines) < 2:
             return []
 
-        batteries = []
+        batteries: List[Battery] = []
         for line in lines[1:]:
             parts = [p.strip() for p in line.split(",")]
             if len(parts) < 4:
@@ -416,7 +435,7 @@ def _get_battery_info_windows_wmic_fallback():
         return []
 
 
-def _get_windows_runtime_details():
+def _get_windows_runtime_details() -> List[Dict[str, Any]]:
     """
     Try to fetch current charge percentage and voltage from Win32_Battery.
     Returns a list of dicts:
@@ -431,22 +450,28 @@ def _get_windows_runtime_details():
             "powershell",
             "-NoProfile",
             "-Command",
-            "Get-CimInstance Win32_Battery | Select-Object DeviceID,EstimatedChargeRemaining,DesignVoltage | ConvertTo-Json -Compress",
+            "Get-CimInstance Win32_Battery | "
+            "Select-Object DeviceID,EstimatedChargeRemaining,DesignVoltage | "
+            "ConvertTo-Json -Compress",
         ]
-        output = subprocess.check_output(cmd, universal_newlines=True, stderr=subprocess.PIPE).strip()
+        output = subprocess.check_output(
+            cmd, universal_newlines=True, stderr=subprocess.PIPE
+        ).strip()
         if not output:
             return []
 
         parsed = json.loads(output)
         rows = parsed if isinstance(parsed, list) else [parsed]
-        runtime_rows = []
+        runtime_rows: List[Dict[str, Any]] = []
         for row in rows:
             if not isinstance(row, dict):
                 continue
             runtime_rows.append(
                 {
                     "device_id": str(row.get("DeviceID") or ""),
-                    "charge_percent": _extract_first_int(str(row.get("EstimatedChargeRemaining") or "")),
+                    "charge_percent": _extract_first_int(
+                        str(row.get("EstimatedChargeRemaining") or "")
+                    ),
                     "voltage_mv": _extract_first_int(str(row.get("DesignVoltage") or "")),
                 }
             )
@@ -455,12 +480,12 @@ def _get_windows_runtime_details():
         return []
 
 
-def _enrich_windows_batteries(batteries):
+def _enrich_windows_batteries(batteries: List[Battery]) -> List[Battery]:
     runtime_rows = _get_windows_runtime_details()
     if not batteries or not runtime_rows:
         return batteries
 
-    by_id = {}
+    by_id: Dict[str, Dict[str, Any]] = {}
     for row in runtime_rows:
         norm_id = _normalize_device_id(row.get("device_id"))
         if norm_id:
@@ -481,7 +506,8 @@ def _enrich_windows_batteries(batteries):
 
         charge_percent = runtime.get("charge_percent", 0)
         if 0 <= charge_percent <= 100 and "full_charge_capacity_mwh" in battery:
-            battery["current_capacity_mwh"] = (battery["full_charge_capacity_mwh"] * charge_percent) / 100.0
+            full_charge_capacity_mwh = battery["full_charge_capacity_mwh"]
+            battery["current_capacity_mwh"] = (full_charge_capacity_mwh * charge_percent) / 100.0
 
         voltage_mv = runtime.get("voltage_mv", 0)
         if voltage_mv > 0:
@@ -490,7 +516,7 @@ def _enrich_windows_batteries(batteries):
     return batteries
 
 
-def get_battery_info_windows():
+def get_battery_info_windows() -> List[Battery]:
     batteries = _get_battery_info_windows_powercfg()
     if batteries:
         return _enrich_windows_batteries(batteries)
@@ -503,12 +529,12 @@ def get_battery_info_windows():
 # ------------------------------------------------------------
 # Linux implementation using sysfs
 # ------------------------------------------------------------
-def get_battery_info_linux():
+def get_battery_info_linux() -> List[Battery]:
     power_supply_path = Path("/sys/class/power_supply")
     if not power_supply_path.exists():
         return []
 
-    batteries = []
+    batteries: List[Battery] = []
     for bat_path in power_supply_path.glob("BAT*"):
         bat_name = bat_path.name
         try:
@@ -562,15 +588,15 @@ def get_battery_info_linux():
 # ------------------------------------------------------------
 # macOS implementation using ioreg
 # ------------------------------------------------------------
-def get_battery_info_macos():
+def get_battery_info_macos() -> List[Battery]:
     try:
         cmd = ["ioreg", "-l", "-w0"]
         output = subprocess.check_output(cmd, universal_newlines=True, stderr=subprocess.PIPE)
 
-        design_cap = None
-        max_cap = None
-        voltage = None
-        cycle_count = None
+        design_cap: Optional[int] = None
+        max_cap: Optional[int] = None
+        voltage: Optional[int] = None
+        cycle_count: Optional[int] = None
         device_name = "InternalBattery"
 
         for line in output.splitlines():
@@ -611,12 +637,12 @@ def get_battery_info_macos():
 # ------------------------------------------------------------
 # Main dispatcher
 # ------------------------------------------------------------
-def _format_hours(hours):
+def _format_hours(hours: float) -> str:
     total_minutes = int(round(hours * 60))
     return f"{total_minutes // 60}h {total_minutes % 60:02d}m"
 
 
-def _print_runtime_estimates(estimates):
+def _print_runtime_estimates(estimates: Dict[str, Any]) -> None:
     print("Estimated Runtime on a Full Charge (100% -> 0%)")
 
     full_charge_hours = estimates.get("full_charge_hours")
@@ -626,7 +652,10 @@ def _print_runtime_estimates(estimates):
     recent_hours = estimates.get("recent_full_charge_hours")
     if recent_hours:
         period_count = estimates.get("recent_period_count", 0)
-        print(f"  Typical, recent:      {_format_hours(recent_hours)}  (last {period_count} periods)")
+        print(
+            f"  Typical, recent:      {_format_hours(recent_hours)}"
+            f"  (last {period_count} periods)"
+        )
 
     design_capacity_hours = estimates.get("design_capacity_hours")
     if design_capacity_hours:
@@ -638,7 +667,7 @@ def _print_runtime_estimates(estimates):
     print()
 
 
-def main():
+def main() -> int:
     system = platform.system()
 
     if system == "Windows":
@@ -675,7 +704,9 @@ def main():
         print()
 
     # System-wide rather than per battery, so it is printed once after the list.
-    estimates = next((bat["runtime_estimates"] for bat in batteries if "runtime_estimates" in bat), None)
+    estimates = next(
+        (bat["runtime_estimates"] for bat in batteries if "runtime_estimates" in bat), None
+    )
     if estimates:
         _print_runtime_estimates(estimates)
 

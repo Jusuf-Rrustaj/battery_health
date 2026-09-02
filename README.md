@@ -78,6 +78,14 @@ Estimated Runtime on a Full Charge (100% -> 0%)
 python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
+## Linting and Type Checking
+```bash
+pip install flake8 mypy
+python -m flake8 .
+python -m mypy .
+```
+Both read their settings from `setup.cfg` and are expected to pass cleanly.
+
 ## Platform Notes
 - Windows:
   - Uses `powercfg /batteryreport` as the primary source.
