@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "battery-health"
-version = "1.0.0"
+version = "1.1.0"
 description = "Cross-platform battery health checker."
 readme = "README.md"
 # tomllib (stdlib, 3.11+) is used by scripts/build.py to read the version below.
